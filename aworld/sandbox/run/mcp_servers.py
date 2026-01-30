@@ -164,6 +164,9 @@ class McpServers:
             context: Context = None,
             event_message: Message = None
     ) -> List[ActionResult]:
+        # DIAGNOSTIC: Log at entry point with WARNING level to ensure visibility
+        logger.warning(f"!!! McpServers.call_tool ENTRY: action_list={action_list}, context={'SET' if context else 'NONE'}")
+
         results = []
         if not action_list:
             return None
@@ -235,13 +238,14 @@ class McpServers:
                         progress: float, total: float | None, message: str | None
                 ):
                     # DIAGNOSTIC: Log at the very start to confirm callback is invoked
-                    logger.info(
-                        f"!!! PROGRESS CALLBACK INVOKED: progress={progress}, total={total}, "
-                        f"message={message.replace(chr(10), chr(92) + 'n') if message else message}"
-                    )
+                    # Using WARNING level and print() to ensure visibility
+                    msg = f"!!! PROGRESS CALLBACK INVOKED: progress={progress}, total={total}, message={message.replace(chr(10), chr(92) + 'n') if message else message}"
+                    print(msg, flush=True)
+                    logger.warning(msg)
 
                     if not context:
                         logger.warning("!!! PROGRESS: context is None, returning early!")
+                        print("!!! PROGRESS: context is None, returning early!", flush=True)
                         return
                     # for debug vnc
                     message_str = message.replace('\n', '\\n') if message else message

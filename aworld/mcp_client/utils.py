@@ -1203,6 +1203,10 @@ async def call_mcp_tool_with_exit_stack(
     max_retry: int = 3,
     timeout: float = 120.0
 ) -> Any:
+    # DIAGNOSTIC: Log entry with progress_callback status
+    msg = f"!!! call_mcp_tool_with_exit_stack: server={server_name}, tool={tool_name}, progress_callback={'PASSED' if progress_callback else 'NONE'}"
+    print(msg, flush=True)
+    logger.warning(msg)
     """Call MCP tool using AsyncExitStack to manage connection lifecycle.
 
     This method creates a new server connection for each call and automatically
@@ -1311,6 +1315,10 @@ async def call_mcp_tool_with_reuse(
     max_retry: int = 3,
     timeout: float = 120.0
 ) -> Any:
+    # DIAGNOSTIC: Log entry with progress_callback status
+    msg = f"!!! call_mcp_tool_with_reuse: server={server_name}, tool={tool_name}, progress_callback={'PASSED' if progress_callback else 'NONE'}"
+    print(msg, flush=True)
+    logger.warning(msg)
     """Call MCP tool using cached server instances (reuse mode).
 
     This method uses cached server instances and includes retry logic similar to
