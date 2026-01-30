@@ -274,6 +274,7 @@ class McpServers:
 
                 if self._should_reuse():
                     # Reuse mode: use cached server instances (delegated to utils.py)
+                    # FORK MODIFICATION: Removed timeout to allow long-running MCP tools
                     call_result_raw = await call_mcp_tool_with_reuse(
                         server_name=server_name,
                         tool_name=tool_name,
@@ -283,14 +284,14 @@ class McpServers:
                         context=context,
                         sandbox_id=sandbox_id,
                         progress_callback=progress_callback,
-                        max_retry=3,
-                        timeout=120.0
+                        max_retry=3
                     )
 
                     if not call_result_raw:
                         call_mcp_e = Exception("Failed to call tool after all retry attempts")
                 else:
                     # Non-reuse mode: use AsyncExitStack (delegated to utils.py)
+                    # FORK MODIFICATION: Removed timeout to allow long-running MCP tools
                     call_result_raw = await call_mcp_tool_with_exit_stack(
                         server_name=server_name,
                         tool_name=tool_name,
@@ -299,8 +300,7 @@ class McpServers:
                         context=context,
                         sandbox_id=sandbox_id,
                         progress_callback=progress_callback,
-                        max_retry=3,
-                        timeout=120.0
+                        max_retry=3
                     )
 
                     if not call_result_raw:
