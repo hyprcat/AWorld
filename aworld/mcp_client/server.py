@@ -172,6 +172,11 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any] | None,read_timeout_seconds: timedelta | None = None,progress_callback: ProgressFnT | None = None) -> CallToolResult:
         """Invoke a tool on the server."""
+        # DIAGNOSTIC: Log to confirm callback is passed to MCP client
+        logger.info(
+            f"!!! MCP call_tool: tool_name={tool_name}, "
+            f"progress_callback={'PASSED' if progress_callback else 'NONE'}"
+        )
         if not self.session:
             raise RuntimeError("Server not initialized. Make sure you call `connect()` first.")
         return await self.session.call_tool(name=tool_name, arguments=arguments,read_timeout_seconds=read_timeout_seconds,progress_callback=progress_callback)

@@ -234,7 +234,14 @@ class McpServers:
                 async def progress_callback(
                         progress: float, total: float | None, message: str | None
                 ):
+                    # DIAGNOSTIC: Log at the very start to confirm callback is invoked
+                    logger.info(
+                        f"!!! PROGRESS CALLBACK INVOKED: progress={progress}, total={total}, "
+                        f"message={message.replace(chr(10), chr(92) + 'n') if message else message}"
+                    )
+
                     if not context:
+                        logger.warning("!!! PROGRESS: context is None, returning early!")
                         return
                     # for debug vnc
                     message_str = message.replace('\n', '\\n') if message else message
