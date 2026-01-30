@@ -284,7 +284,8 @@ class McpServers:
                         context=context,
                         sandbox_id=sandbox_id,
                         progress_callback=progress_callback,
-                        max_retry=3
+                        max_retry=3,
+                        timeout=9999
                     )
 
                     if not call_result_raw:
@@ -300,7 +301,8 @@ class McpServers:
                         context=context,
                         sandbox_id=sandbox_id,
                         progress_callback=progress_callback,
-                        max_retry=3
+                        max_retry=3,
+                        timeout=9999
                     )
 
                     if not call_result_raw:
