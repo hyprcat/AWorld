@@ -106,9 +106,18 @@ class VertexAIProvider(LLMProviderBase):
         return model.startswith("gemini-")
 
     def _build_vertex_openai_base_url(self) -> str:
-        """Build the Vertex AI OpenAI-compatible endpoint URL for Model Garden models."""
+        """Build the Vertex AI OpenAI-compatible endpoint URL for Model Garden models.
+
+        For 'global' location: https://aiplatform.googleapis.com/v1/projects/{p}/locations/global/endpoints/openapi
+        For regional locations: https://{loc}-aiplatform.googleapis.com/v1beta1/projects/{p}/locations/{loc}/endpoints/openapi
+        """
         location = self._vertex_location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
         project = self._vertex_project or os.getenv("GOOGLE_CLOUD_PROJECT")
+        if location == "global":
+            return (
+                f"https://aiplatform.googleapis.com/v1/"
+                f"projects/{project}/locations/global/endpoints/openapi"
+            )
         return (
             f"https://{location}-aiplatform.googleapis.com/v1beta1/"
             f"projects/{project}/locations/{location}/endpoints/openapi"
