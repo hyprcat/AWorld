@@ -12,8 +12,13 @@ class VertexAIProvider(LLMProviderBase):
     """Google Vertex AI / Gemini API provider using the google-genai SDK.
 
     Supports two modes:
-    - Vertex AI mode: Uses GCP project + Application Default Credentials
+    - Vertex AI mode: Uses GCP project + credentials (ADC, access token, or credentials object)
     - Gemini Developer API mode: Uses API key authentication
+
+    Vertex AI authentication options (via ext_config or env vars):
+    - Application Default Credentials (default, no extra config needed)
+    - access_token: Raw OAuth2 access token string (or GOOGLE_ACCESS_TOKEN env var)
+    - credentials: A pre-built google.oauth2.credentials.Credentials object
 
     Mode is determined by explicit config, environment variables, or auto-detection.
     """
@@ -29,6 +34,8 @@ class VertexAIProvider(LLMProviderBase):
         self._vertex_project = kwargs.pop("project", None)
         self._vertex_location = kwargs.pop("location", None)
         self._vertex_explicit = kwargs.pop("vertexai", None)
+        self._vertex_credentials = kwargs.pop("credentials", None)
+        self._vertex_access_token = kwargs.pop("access_token", None)
 
         import_package("google.genai", install_name="google-genai")
 
@@ -49,7 +56,9 @@ class VertexAIProvider(LLMProviderBase):
         if env_val is not None:
             return env_val.lower() in ("true", "1", "yes")
 
-        # 3. Auto-detect: project set → Vertex, api_key set → Gemini API
+        # 3. Auto-detect: credentials/token/project set → Vertex, api_key set → Gemini API
+        if self._vertex_credentials or self._vertex_access_token or os.getenv("GOOGLE_ACCESS_TOKEN"):
+            return True
         if self._vertex_project or os.getenv("GOOGLE_CLOUD_PROJECT"):
             return True
         if self.api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
@@ -57,6 +66,30 @@ class VertexAIProvider(LLMProviderBase):
 
         # Default to Vertex AI mode
         return True
+
+    def _resolve_credentials(self):
+        """Resolve credentials for Vertex AI mode.
+
+        Priority:
+        1. Explicit credentials object passed via ext_config
+        2. Access token string (from ext_config or GOOGLE_ACCESS_TOKEN env var)
+        3. None (falls back to Application Default Credentials in the SDK)
+
+        Returns:
+            A google.oauth2.credentials.Credentials object, or None for ADC.
+        """
+        # 1. Pre-built credentials object
+        if self._vertex_credentials is not None:
+            return self._vertex_credentials
+
+        # 2. Raw access token → wrap in OAuth2 Credentials
+        access_token = self._vertex_access_token or os.getenv("GOOGLE_ACCESS_TOKEN")
+        if access_token:
+            from google.oauth2.credentials import Credentials as OAuth2Credentials
+            return OAuth2Credentials(token=access_token)
+
+        # 3. ADC (let the SDK handle it)
+        return None
 
     def _init_provider(self):
         """Initialize google-genai client.
@@ -78,8 +111,17 @@ class VertexAIProvider(LLMProviderBase):
                     "or provide 'project' in ext_config."
                 )
 
-            logger.info(f"Initializing Vertex AI provider (project={project}, location={location})")
-            return genai.Client(vertexai=True, project=project, location=location)
+            credentials = self._resolve_credentials()
+            client_kwargs = dict(vertexai=True, project=project, location=location)
+            if credentials is not None:
+                client_kwargs["credentials"] = credentials
+                logger.info(f"Initializing Vertex AI provider with explicit credentials "
+                            f"(project={project}, location={location})")
+            else:
+                logger.info(f"Initializing Vertex AI provider with ADC "
+                            f"(project={project}, location={location})")
+
+            return genai.Client(**client_kwargs)
         else:
             api_key = self.api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
