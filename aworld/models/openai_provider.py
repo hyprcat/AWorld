@@ -183,7 +183,9 @@ class OpenAIProvider(LLMProviderBase):
                 tool_calls = chunk_choice.delta.tool_calls if hasattr(chunk_choice, 'delta') else chunk_choice.get("delta", {}).get("tool_calls")
 
                 for tool_call in tool_calls:
-                    index = tool_call.index if hasattr(tool_call, 'index') else tool_call["index"]
+                    index = tool_call.index if hasattr(tool_call, 'index') else tool_call.get("index") if isinstance(tool_call, dict) else None
+                    if index is None:
+                        index = len(self.stream_tool_buffer)
                     func_name = tool_call.function.name if hasattr(tool_call, 'function') else tool_call.get("function", {}).get("name")
                     func_args = tool_call.function.arguments if hasattr(tool_call, 'function') else tool_call.get("function", {}).get("arguments")
                     if index >= len(self.stream_tool_buffer):
@@ -379,6 +381,17 @@ class OpenAIProvider(LLMProviderBase):
         try:
             openai_params = self.get_openai_params(processed_messages, temperature, max_tokens, stop, **kwargs)
             openai_params["stream"] = True
+
+            # Debug: log params (excluding messages for brevity) to diagnose Gemini null errors
+            debug_params = {k: v for k, v in openai_params.items() if k != "messages"}
+            debug_params["message_roles"] = [m.get("role") for m in openai_params.get("messages", [])]
+            debug_params["message_content_types"] = [{
+                "role": m.get("role"),
+                "content_type": type(m.get("content")).__name__,
+                "content_is_none": m.get("content") is None,
+                "has_tool_calls": "tool_calls" in m,
+            } for m in openai_params.get("messages", [])]
+            logger.warning(f"[DEBUG] openai_params (no messages): {debug_params}")
 
             if self.is_http_provider:
                 async for chunk in self.http_provider.async_stream_call(openai_params):

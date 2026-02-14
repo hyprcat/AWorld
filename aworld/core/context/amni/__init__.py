@@ -16,8 +16,7 @@ from aworld.dataset.types import TrajectoryItem
 from aworld.logs.util import logger
 from aworld.memory.models import MemoryMessage, UserProfile, Fact
 from aworld.output import Artifact, WorkSpace, StreamingOutputs
-from .config import AgentContextConfig, AmniContextConfig, AmniConfigFactory
-from .config import AgentContextConfig, AmniContextConfig, AmniConfigFactory, ContextEnvConfig
+from .config import AgentContextConfig, AmniContextConfig, AmniConfigFactory, ContextEnvConfig, init_middlewares
 from .contexts import ContextManager
 from .prompt.prompts import AMNI_CONTEXT_PROMPT
 from .retrieval.artifacts import SearchArtifact

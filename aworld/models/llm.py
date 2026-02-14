@@ -231,7 +231,7 @@ class LLMModel:
         """Identify LLM provider.
 
         Identification logic:
-        1. If provider is specified and doesn't need to be overridden, use the specified provider.
+        1. If provider is explicitly specified, validate and use it directly.
         2. If base_url is provided, try to identify provider based on base_url.
         3. If model_name is provided, try to identify provider based on model_name.
         4. If none can be identified, default to "openai".
@@ -244,33 +244,34 @@ class LLMModel:
         Returns:
             str: Identified provider.
         """
-        # Default provider
-        identified_provider = "openai"
+        # If provider is explicitly specified, use it directly
+        if provider:
+            if provider not in PROVIDER_CLASSES:
+                raise ValueError(
+                    f"Unknown LLM provider: '{provider}'. "
+                    f"Supported providers: {list(PROVIDER_CLASSES.keys())}"
+                )
+            logger.info(f"Using explicitly specified provider: {provider}")
+            return provider
 
-        # Identify provider based on base_url
+        # Auto-detect provider based on base_url
         if base_url:
             for p, patterns in ENDPOINT_PATTERNS.items():
                 if any(pattern in base_url for pattern in patterns):
-                    identified_provider = p
                     logger.info(
-                        f"Identified provider: {identified_provider} based on base_url: {base_url}")
-                    return identified_provider
+                        f"Identified provider: {p} based on base_url: {base_url}")
+                    return p
 
-        # Identify provider based on model_name
-        if model_name and not base_url:
+        # Auto-detect provider based on model_name
+        if model_name:
             for p, models in MODEL_NAMES.items():
                 if model_name in models or any(model_name.startswith(model) for model in models):
-                    identified_provider = p
                     logger.info(
-                        f"Identified provider: {identified_provider} based on model_name: {model_name}")
-                    break
+                        f"Identified provider: {p} based on model_name: {model_name}")
+                    return p
 
-        if provider and provider in PROVIDER_CLASSES and identified_provider and identified_provider != provider:
-            logger.debug(
-                f"Provider mismatch: {provider} != {identified_provider}, using {provider} as provider")
-            identified_provider = provider
-
-        return identified_provider
+        # Default to openai
+        return "openai"
 
     def _create_provider(self, **kwargs):
         """Return the corresponding provider instance based on provider.
