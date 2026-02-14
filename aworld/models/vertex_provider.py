@@ -761,7 +761,8 @@ class VertexAIProvider(LLMProviderBase):
                     if not chunk:
                         continue
                     resp = self.postprocess_stream_response(chunk)
-                    self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
+                    resp.usage = self._sanitize_usage(resp.usage)
+                    self._accumulate_chunk_usage(usage, resp.usage)
                     yield resp
             else:
                 if not self._mg_provider:
@@ -776,7 +777,8 @@ class VertexAIProvider(LLMProviderBase):
                         continue
                     resp, finish_reason = self._postprocess_mg_stream_chunk(chunk)
                     if resp:
-                        self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
+                        resp.usage = self._sanitize_usage(resp.usage)
+                        self._accumulate_chunk_usage(usage, resp.usage)
                         yield resp
                         if finish_reason and resp.tool_calls:
                             yield ModelResponse(
@@ -816,7 +818,8 @@ class VertexAIProvider(LLMProviderBase):
                     if not chunk:
                         continue
                     resp = self.postprocess_stream_response(chunk)
-                    self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
+                    resp.usage = self._sanitize_usage(resp.usage)
+                    self._accumulate_chunk_usage(usage, resp.usage)
                     yield resp
             else:
                 if not self._mg_async_provider:
@@ -832,7 +835,8 @@ class VertexAIProvider(LLMProviderBase):
                         continue
                     resp, finish_reason = self._postprocess_mg_stream_chunk(chunk)
                     if resp:
-                        self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
+                        resp.usage = self._sanitize_usage(resp.usage)
+                        self._accumulate_chunk_usage(usage, resp.usage)
                         yield resp
                         if finish_reason and resp.tool_calls:
                             yield ModelResponse(
