@@ -526,6 +526,13 @@ class VertexAIProvider(LLMProviderBase):
             processed.append(msg_copy)
         return processed
 
+    @staticmethod
+    def _sanitize_usage(usage: dict) -> dict:
+        """Replace None values in usage dict with 0 so Counter arithmetic works."""
+        if not usage:
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {k: (v if v is not None else 0) for k, v in usage.items()}
+
     def _build_openai_params(self,
                              messages: List[Dict[str, str]],
                              temperature: float = 0.0,
@@ -651,7 +658,7 @@ class VertexAIProvider(LLMProviderBase):
                     if not chunk:
                         continue
                     resp = self.postprocess_stream_response(chunk)
-                    self._accumulate_chunk_usage(usage, resp.usage)
+                    self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
                     yield resp
             else:
                 if not self._mg_provider:
@@ -663,7 +670,7 @@ class VertexAIProvider(LLMProviderBase):
                     if not chunk:
                         continue
                     resp = ModelResponse.from_openai_stream_chunk(chunk)
-                    self._accumulate_chunk_usage(usage, resp.usage)
+                    self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
                     yield resp
 
         except Exception as e:
@@ -699,7 +706,7 @@ class VertexAIProvider(LLMProviderBase):
                     if not chunk:
                         continue
                     resp = self.postprocess_stream_response(chunk)
-                    self._accumulate_chunk_usage(usage, resp.usage)
+                    self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
                     yield resp
             else:
                 if not self._mg_async_provider:
@@ -712,7 +719,7 @@ class VertexAIProvider(LLMProviderBase):
                     if not chunk:
                         continue
                     resp = ModelResponse.from_openai_stream_chunk(chunk)
-                    self._accumulate_chunk_usage(usage, resp.usage)
+                    self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
                     yield resp
 
         except Exception as e:
