@@ -16,6 +16,7 @@ from aworld.core.llm_provider import LLMProviderBase
 from aworld.models.openai_provider import OpenAIProvider, AzureOpenAIProvider
 from aworld.models.anthropic_provider import AnthropicProvider
 from aworld.models.ant_provider import AntProvider
+from aworld.models.vertex_provider import VertexAIProvider
 from aworld.models.model_response import ModelResponse
 from aworld.core.context.base import Context
 from aworld.core.model_output_parser import ModelOutputParser, BaseContentParser
@@ -26,6 +27,9 @@ MODEL_NAMES = {
     "anthropic": ["claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20240620", "claude-3-opus-20240229"],
     "openai": ["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o3-mini", "gpt-4o-mini"],
     "azure_openai": ["gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-35-turbo"],
+    "vertex_ai": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
+                   "gemini-2.0-flash", "gemini-2.0-flash-lite",
+                   "gemini-1.5-pro", "gemini-1.5-flash"],
 }
 
 # Endpoint patterns for identifying providers
@@ -34,6 +38,7 @@ ENDPOINT_PATTERNS = {
     "anthropic": ["api.anthropic.com", "claude-api"],
     "azure_openai": ["openai.azure.com"],
     "ant": ["zdfmng.alipay.com"],
+    "vertex_ai": ["aiplatform.googleapis.com", "generativelanguage.googleapis.com"],
 }
 
 # Provider class mapping
@@ -42,6 +47,7 @@ PROVIDER_CLASSES = {
     "anthropic": AnthropicProvider,
     "azure_openai": AzureOpenAIProvider,
     "ant": AntProvider,
+    "vertex_ai": VertexAIProvider,
 }
 
 

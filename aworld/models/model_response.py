@@ -616,6 +616,234 @@ class ModelResponse:
                 response)
 
     @classmethod
+    def from_vertex_response(cls, response: Any, model_name: str = "gemini") -> 'ModelResponse':
+        """
+        Create ModelResponse from Google Vertex AI (google-genai) response object.
+
+        Args:
+            response: google.genai GenerateContentResponse object
+            model_name: Model name used
+
+        Returns:
+            ModelResponse object
+
+        Raises:
+            LLMResponseError: When response is blocked by safety filters
+        """
+        try:
+            # Check for safety blocks via prompt_feedback
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                feedback = response.prompt_feedback
+                if hasattr(feedback, 'block_reason') and feedback.block_reason:
+                    raise LLMResponseError(
+                        f"Request blocked by safety filter: {feedback.block_reason}",
+                        model_name,
+                        response
+                    )
+
+            # Extract content from candidates
+            content_parts = []
+            reasoning_parts = []
+            processed_tool_calls = []
+
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+
+                # Map finish reason
+                finish_reason = None
+                if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                    reason = str(candidate.finish_reason)
+                    if 'STOP' in reason:
+                        finish_reason = 'stop'
+                    elif 'MAX_TOKENS' in reason:
+                        finish_reason = 'length'
+                    elif 'SAFETY' in reason or 'RECITATION' in reason:
+                        finish_reason = 'content_filter'
+                    else:
+                        finish_reason = reason.lower()
+
+                if hasattr(candidate, 'content') and candidate.content:
+                    parts = candidate.content.parts or []
+                    for part in parts:
+                        # Check for thinking/reasoning parts
+                        if hasattr(part, 'thought') and part.thought:
+                            if hasattr(part, 'text') and part.text:
+                                reasoning_parts.append(part.text)
+                        # Check for function calls
+                        elif hasattr(part, 'function_call') and part.function_call:
+                            fc = part.function_call
+                            args_str = json.dumps(dict(fc.args), ensure_ascii=False) if fc.args else "{}"
+                            tool_id = f"call_{hash(fc.name + args_str) & 0xffffffff:08x}"
+                            tool_call_dict = {
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {
+                                    "name": fc.name,
+                                    "arguments": args_str
+                                }
+                            }
+                            processed_tool_calls.append(ToolCall.from_dict(tool_call_dict))
+                        # Text content
+                        elif hasattr(part, 'text') and part.text:
+                            content_parts.append(part.text)
+            else:
+                raise LLMResponseError(
+                    "No candidates found in Vertex AI response",
+                    model_name,
+                    response
+                )
+
+            content = "".join(content_parts)
+            reasoning_content = "".join(reasoning_parts) if reasoning_parts else None
+
+            # Extract usage
+            usage = {
+                "completion_tokens": 0,
+                "prompt_tokens": 0,
+                "total_tokens": 0
+            }
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                um = response.usage_metadata
+                usage["prompt_tokens"] = getattr(um, 'prompt_token_count', 0) or 0
+                usage["completion_tokens"] = getattr(um, 'candidates_token_count', 0) or 0
+                usage["total_tokens"] = getattr(um, 'total_token_count', 0) or 0
+
+            # Build message
+            message = {
+                "role": "assistant",
+                "content": content,
+            }
+            if processed_tool_calls:
+                message["tool_calls"] = [tc.to_dict() for tc in processed_tool_calls]
+
+            response_id = f"vertex-{hash(str(response)) & 0xffffffff:08x}"
+
+            return cls(
+                id=response_id,
+                model=model_name,
+                content=content,
+                tool_calls=processed_tool_calls or None,
+                usage=usage,
+                raw_response=response,
+                message=message,
+                reasoning_content=reasoning_content,
+                finish_reason=finish_reason
+            )
+        except Exception as e:
+            if isinstance(e, LLMResponseError):
+                raise e
+            raise LLMResponseError(
+                f"Error processing Vertex AI response: {str(e)}",
+                model_name,
+                response
+            )
+
+    @classmethod
+    def from_vertex_stream_chunk(cls, chunk: Any, model_name: str = "gemini") -> 'ModelResponse':
+        """
+        Create ModelResponse from Google Vertex AI (google-genai) streaming chunk.
+
+        Note: google-genai delivers complete parts per chunk (not deltas like OpenAI),
+        so no stream_tool_buffer accumulation is needed.
+
+        Args:
+            chunk: google.genai streaming chunk
+            model_name: Model name used
+
+        Returns:
+            ModelResponse object
+
+        Raises:
+            LLMResponseError: When chunk contains errors
+        """
+        try:
+            content_parts = []
+            reasoning_parts = []
+            processed_tool_calls = []
+            finish_reason = None
+
+            if hasattr(chunk, 'candidates') and chunk.candidates:
+                candidate = chunk.candidates[0]
+
+                if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                    reason = str(candidate.finish_reason)
+                    if 'STOP' in reason:
+                        finish_reason = 'stop'
+                    elif 'MAX_TOKENS' in reason:
+                        finish_reason = 'length'
+                    elif 'SAFETY' in reason or 'RECITATION' in reason:
+                        finish_reason = 'content_filter'
+                    else:
+                        finish_reason = reason.lower()
+
+                if hasattr(candidate, 'content') and candidate.content:
+                    parts = candidate.content.parts or []
+                    for part in parts:
+                        if hasattr(part, 'thought') and part.thought:
+                            if hasattr(part, 'text') and part.text:
+                                reasoning_parts.append(part.text)
+                        elif hasattr(part, 'function_call') and part.function_call:
+                            fc = part.function_call
+                            args_str = json.dumps(dict(fc.args), ensure_ascii=False) if fc.args else "{}"
+                            tool_id = f"call_{hash(fc.name + args_str) & 0xffffffff:08x}"
+                            tool_call_dict = {
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {
+                                    "name": fc.name,
+                                    "arguments": args_str
+                                }
+                            }
+                            processed_tool_calls.append(ToolCall.from_dict(tool_call_dict))
+                        elif hasattr(part, 'text') and part.text:
+                            content_parts.append(part.text)
+
+            content = "".join(content_parts) if content_parts else ""
+            reasoning_content = "".join(reasoning_parts) if reasoning_parts else None
+
+            # Extract usage
+            usage = {
+                "completion_tokens": 0,
+                "prompt_tokens": 0,
+                "total_tokens": 0
+            }
+            if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                um = chunk.usage_metadata
+                usage["prompt_tokens"] = getattr(um, 'prompt_token_count', 0) or 0
+                usage["completion_tokens"] = getattr(um, 'candidates_token_count', 0) or 0
+                usage["total_tokens"] = getattr(um, 'total_token_count', 0) or 0
+
+            message = {
+                "role": "assistant",
+                "content": content,
+                "is_chunk": True
+            }
+            if processed_tool_calls:
+                message["tool_calls"] = [tc.to_dict() for tc in processed_tool_calls]
+
+            chunk_id = f"vertex-{hash(str(chunk)) & 0xffffffff:08x}"
+
+            return cls(
+                id=chunk_id,
+                model=model_name,
+                content=content,
+                tool_calls=processed_tool_calls or None,
+                usage=usage,
+                raw_response=chunk,
+                message=message,
+                reasoning_content=reasoning_content,
+                finish_reason=finish_reason
+            )
+        except Exception as e:
+            if isinstance(e, LLMResponseError):
+                raise e
+            raise LLMResponseError(
+                f"Error processing Vertex AI stream chunk: {str(e)}",
+                model_name,
+                chunk
+            )
+
+    @classmethod
     def from_error(cls, error_msg: str, model: str = "unknown") -> 'ModelResponse':
         """
         Create ModelResponse from error message
