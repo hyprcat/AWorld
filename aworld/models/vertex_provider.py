@@ -533,6 +533,109 @@ class VertexAIProvider(LLMProviderBase):
             return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         return {k: (v if v is not None else 0) for k, v in usage.items()}
 
+    def _postprocess_mg_stream_chunk(self, chunk: Any):
+        """Process a Model Garden (OpenAI-compatible) stream chunk.
+
+        Handles incremental tool call accumulation via stream_tool_buffer,
+        matching the OpenAI provider's streaming logic.
+
+        Returns:
+            Tuple of (ModelResponse or None, finish_reason or None).
+            Returns (None, None) for tool-call-only chunks with no text content.
+        """
+        from aworld.models.model_response import ToolCall
+
+        # Error check
+        if hasattr(chunk, 'error') or (isinstance(chunk, dict) and chunk.get('error')):
+            error_msg = chunk.error if hasattr(chunk, 'error') else chunk.get('error', 'Unknown error')
+            raise LLMResponseError(error_msg, self.model_name or "unknown", chunk)
+
+        chunk_choice = None
+        if hasattr(chunk, 'choices') and chunk.choices:
+            chunk_choice = chunk.choices[0]
+        elif isinstance(chunk, dict) and chunk.get("choices") and chunk["choices"]:
+            chunk_choice = chunk["choices"][0]
+
+        if not chunk_choice:
+            return None, None
+
+        # Accumulate tool call arguments
+        delta_tool_calls = None
+        if hasattr(chunk_choice, 'delta') and chunk_choice.delta:
+            delta_tool_calls = getattr(chunk_choice.delta, 'tool_calls', None)
+        elif isinstance(chunk_choice, dict):
+            delta_tool_calls = chunk_choice.get("delta", {}).get("tool_calls")
+
+        if delta_tool_calls:
+            for tool_call in delta_tool_calls:
+                index = getattr(tool_call, 'index', None)
+                if index is None:
+                    index = tool_call.get("index") if isinstance(tool_call, dict) else len(self.stream_tool_buffer)
+                if index is None:
+                    index = len(self.stream_tool_buffer)
+
+                func = getattr(tool_call, 'function', None)
+                if func is None and isinstance(tool_call, dict):
+                    func_dict = tool_call.get("function", {})
+                    func_name = func_dict.get("name")
+                    func_args = func_dict.get("arguments", "")
+                else:
+                    func_name = getattr(func, 'name', None) if func else None
+                    func_args = getattr(func, 'arguments', "") if func else ""
+
+                tc_id = getattr(tool_call, 'id', None)
+                if tc_id is None and isinstance(tool_call, dict):
+                    tc_id = tool_call.get("id")
+
+                if index >= len(self.stream_tool_buffer):
+                    self.stream_tool_buffer.append({
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": func_name,
+                            "arguments": func_args or ""
+                        }
+                    })
+                else:
+                    self.stream_tool_buffer[index]["function"]["arguments"] += (func_args or "")
+
+            # Tool-call-only chunk with no text — suppress
+            delta_content = None
+            if hasattr(chunk_choice, 'delta') and chunk_choice.delta:
+                delta_content = getattr(chunk_choice.delta, 'content', None)
+            elif isinstance(chunk_choice, dict):
+                delta_content = chunk_choice.get("delta", {}).get("content")
+            if not delta_content:
+                return None, None
+
+        # Check finish reason
+        finish_reason = None
+        if hasattr(chunk_choice, 'finish_reason'):
+            finish_reason = chunk_choice.finish_reason
+        elif isinstance(chunk_choice, dict):
+            finish_reason = chunk_choice.get("finish_reason")
+
+        # On finish with buffered tool calls, emit them as a complete chunk
+        if finish_reason and self.stream_tool_buffer:
+            tool_call_chunk = {
+                "id": chunk.id if hasattr(chunk, 'id') else chunk.get("id", "unknown"),
+                "model": chunk.model if hasattr(chunk, 'model') else chunk.get("model", "unknown"),
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "delta": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": self.stream_tool_buffer
+                    }
+                }]
+            }
+            self.stream_tool_buffer = []
+            resp = ModelResponse.from_openai_stream_chunk(tool_call_chunk)
+            return resp, finish_reason
+
+        resp = ModelResponse.from_openai_stream_chunk(chunk)
+        return resp, finish_reason
+
     def _build_openai_params(self,
                              messages: List[Dict[str, str]],
                              temperature: float = 0.0,
@@ -666,12 +769,19 @@ class VertexAIProvider(LLMProviderBase):
                         "Model Garden provider not initialized. Ensure Vertex AI mode is enabled.")
                 openai_params = self._build_openai_params(messages, temperature, max_tokens, stop, **kwargs)
                 openai_params["stream"] = True
+                openai_params["stream_options"] = {"include_usage": True}
+                self.stream_tool_buffer = []
                 for chunk in self._mg_provider.chat.completions.create(**openai_params):
                     if not chunk:
                         continue
-                    resp = ModelResponse.from_openai_stream_chunk(chunk)
-                    self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
-                    yield resp
+                    resp, finish_reason = self._postprocess_mg_stream_chunk(chunk)
+                    if resp:
+                        self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
+                        yield resp
+                        if finish_reason and resp.tool_calls:
+                            yield ModelResponse(
+                                id=resp.id, model=resp.model,
+                                content="", finish_reason=finish_reason, usage=usage)
 
         except Exception as e:
             if isinstance(e, LLMResponseError):
@@ -714,13 +824,20 @@ class VertexAIProvider(LLMProviderBase):
                         "Model Garden async provider not initialized. Ensure Vertex AI mode is enabled.")
                 openai_params = self._build_openai_params(messages, temperature, max_tokens, stop, **kwargs)
                 openai_params["stream"] = True
+                openai_params["stream_options"] = {"include_usage": True}
+                self.stream_tool_buffer = []
                 stream = await self._mg_async_provider.chat.completions.create(**openai_params)
                 async for chunk in stream:
                     if not chunk:
                         continue
-                    resp = ModelResponse.from_openai_stream_chunk(chunk)
-                    self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
-                    yield resp
+                    resp, finish_reason = self._postprocess_mg_stream_chunk(chunk)
+                    if resp:
+                        self._accumulate_chunk_usage(usage, self._sanitize_usage(resp.usage))
+                        yield resp
+                        if finish_reason and resp.tool_calls:
+                            yield ModelResponse(
+                                id=resp.id, model=resp.model,
+                                content="", finish_reason=finish_reason, usage=usage)
 
         except Exception as e:
             if isinstance(e, LLMResponseError):
