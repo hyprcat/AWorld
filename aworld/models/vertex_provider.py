@@ -2,10 +2,30 @@ import json
 import os
 from typing import Any, Dict, List, Generator, AsyncGenerator
 
+import httpx
+
 from aworld.utils import import_package
 from aworld.logs.util import logger
 from aworld.core.llm_provider import LLMProviderBase
 from aworld.models.model_response import ModelResponse, LLMResponseError
+
+
+class _VertexAuth(httpx.Auth):
+    """httpx Auth handler that injects a fresh GCP access token on every request.
+
+    Handles automatic token refresh for ADC and explicit credentials,
+    so OpenAI-compatible Model Garden calls always use a valid bearer token.
+    """
+
+    def __init__(self, credentials):
+        self.credentials = credentials
+
+    def auth_flow(self, request):
+        import google.auth.transport.requests
+        if not self.credentials.token or (hasattr(self.credentials, 'expired') and self.credentials.expired):
+            self.credentials.refresh(google.auth.transport.requests.Request())
+        request.headers["Authorization"] = f"Bearer {self.credentials.token}"
+        yield request
 
 
 class VertexAIProvider(LLMProviderBase):
@@ -19,6 +39,10 @@ class VertexAIProvider(LLMProviderBase):
     - Application Default Credentials (default, no extra config needed)
     - access_token: Raw OAuth2 access token string (or GOOGLE_ACCESS_TOKEN env var)
     - credentials: A pre-built google.oauth2.credentials.Credentials object
+
+    Model routing:
+    - Gemini models (gemini-*): Uses google-genai SDK generateContent API
+    - Model Garden models (e.g. zai-org/glm-4.7-maas): Uses Vertex AI's OpenAI-compatible endpoint
 
     Mode is determined by explicit config, environment variables, or auto-detection.
     """
@@ -39,7 +63,12 @@ class VertexAIProvider(LLMProviderBase):
 
         import_package("google.genai", install_name="google-genai")
 
+        # Model Garden OpenAI clients (initialized lazily in _init_provider if needed)
+        self._mg_provider = None
+        self._mg_async_provider = None
+
         super().__init__(api_key, base_url, model_name, sync_enabled, async_enabled, **kwargs)
+        self._post_init()
 
     def _determine_mode(self) -> bool:
         """Determine whether to use Vertex AI mode or Gemini Developer API mode.
@@ -66,6 +95,72 @@ class VertexAIProvider(LLMProviderBase):
 
         # Default to Vertex AI mode
         return True
+
+    def _is_gemini_model(self) -> bool:
+        """Check if the current model is a native Gemini model.
+
+        Gemini models use the google-genai generateContent API.
+        Non-Gemini models (Model Garden) use the OpenAI-compatible endpoint.
+        """
+        model = self.model_name or ""
+        return model.startswith("gemini-")
+
+    def _build_vertex_openai_base_url(self) -> str:
+        """Build the Vertex AI OpenAI-compatible endpoint URL for Model Garden models."""
+        location = self._vertex_location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+        project = self._vertex_project or os.getenv("GOOGLE_CLOUD_PROJECT")
+        return (
+            f"https://{location}-aiplatform.googleapis.com/v1beta1/"
+            f"projects/{project}/locations/{location}/endpoints/openapi"
+        )
+
+    def _get_gcp_credentials(self):
+        """Get GCP credentials for Model Garden API calls.
+
+        Returns a google.auth.credentials.Credentials object with auto-refresh capability.
+        """
+        # 1. Explicit credentials object
+        if self._vertex_credentials is not None:
+            return self._vertex_credentials
+
+        # 2. Access token → wrap in OAuth2 Credentials
+        access_token = self._vertex_access_token or os.getenv("GOOGLE_ACCESS_TOKEN")
+        if access_token:
+            from google.oauth2.credentials import Credentials as OAuth2Credentials
+            return OAuth2Credentials(token=access_token)
+
+        # 3. ADC
+        import google.auth
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        return creds
+
+    def _init_model_garden_clients(self):
+        """Initialize OpenAI-compatible clients for Model Garden models on Vertex AI.
+
+        Uses httpx auth middleware to inject fresh GCP bearer tokens automatically.
+        """
+        from openai import OpenAI, AsyncOpenAI
+
+        credentials = self._get_gcp_credentials()
+        base_url = self._build_vertex_openai_base_url()
+        auth = _VertexAuth(credentials)
+
+        if self.need_sync:
+            self._mg_provider = OpenAI(
+                api_key="PLACEHOLDER",
+                base_url=base_url,
+                http_client=httpx.Client(auth=auth),
+            )
+        if self.need_async:
+            self._mg_async_provider = AsyncOpenAI(
+                api_key="PLACEHOLDER",
+                base_url=base_url,
+                http_client=httpx.AsyncClient(auth=auth),
+            )
+
+        logger.info(f"Initialized Model Garden OpenAI client (base_url={base_url})")
 
     def _resolve_credentials(self):
         """Resolve credentials for Vertex AI mode.
@@ -133,6 +228,13 @@ class VertexAIProvider(LLMProviderBase):
 
             logger.info("Initializing Gemini Developer API provider")
             return genai.Client(api_key=api_key)
+
+    def _post_init(self):
+        """Called after both sync and async providers are initialized.
+        Sets up Model Garden OpenAI clients for non-Gemini models.
+        """
+        if self._determine_mode() and not self._is_gemini_model():
+            self._init_model_garden_clients()
 
     def _init_async_provider(self):
         """Initialize async provider. google-genai uses client.aio for async operations,
@@ -385,6 +487,62 @@ class VertexAIProvider(LLMProviderBase):
 
         return ModelResponse.from_vertex_stream_chunk(chunk, self.model_name or "gemini")
 
+    # ------------------------------------------------------------------ #
+    #  Model Garden helpers (OpenAI-compatible endpoint)                   #
+    # ------------------------------------------------------------------ #
+
+    def _preprocess_messages_for_openai(self, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """Preprocess messages for OpenAI-compatible Model Garden endpoint.
+
+        Ensures tool_calls in assistant messages are plain dicts (not ToolCall objects).
+        """
+        from aworld.models.model_response import ToolCall
+        processed = []
+        for msg in messages:
+            msg_copy = dict(msg)
+            if msg_copy.get("role") == "assistant" and "tool_calls" in msg_copy and msg_copy["tool_calls"]:
+                if msg_copy.get("content") is None:
+                    msg_copy["content"] = ""
+                serialized_tcs = []
+                for tc in msg_copy["tool_calls"]:
+                    if isinstance(tc, ToolCall):
+                        serialized_tcs.append(tc.to_dict())
+                    elif isinstance(tc, dict):
+                        serialized_tcs.append(tc)
+                    elif hasattr(tc, '__dict__'):
+                        serialized_tcs.append(tc.__dict__)
+                    else:
+                        serialized_tcs.append(tc)
+                msg_copy["tool_calls"] = serialized_tcs
+            processed.append(msg_copy)
+        return processed
+
+    def _build_openai_params(self,
+                             messages: List[Dict[str, str]],
+                             temperature: float = 0.0,
+                             max_tokens: int = None,
+                             stop: List[str] = None,
+                             **kwargs) -> Dict[str, Any]:
+        """Build parameters for OpenAI-compatible chat completions (Model Garden)."""
+        processed_messages = self._preprocess_messages_for_openai(messages)
+        params = {
+            "model": kwargs.get("model_name", self.model_name or ""),
+            "messages": processed_messages,
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
+        if stop:
+            params["stop"] = stop
+        for key in ("top_p", "tools", "tool_choice", "response_format"):
+            if key in kwargs and kwargs[key]:
+                params[key] = kwargs[key]
+        return params
+
+    # ------------------------------------------------------------------ #
+    #  Completion methods                                                  #
+    # ------------------------------------------------------------------ #
+
     def completion(self,
                    messages: List[Dict[str, str]],
                    temperature: float = 0.0,
@@ -393,28 +551,28 @@ class VertexAIProvider(LLMProviderBase):
                    **kwargs) -> ModelResponse:
         """Synchronously call Vertex AI to generate response.
 
-        Args:
-            messages: Message list.
-            temperature: Temperature parameter.
-            max_tokens: Maximum number of tokens to generate.
-            stop: List of stop sequences.
-            **kwargs: Other parameters.
-
-        Returns:
-            ModelResponse object.
-
-        Raises:
-            LLMResponseError: When API call fails.
+        Routes to google-genai for Gemini models, OpenAI-compatible endpoint for Model Garden.
         """
-        if not self.provider:
-            raise RuntimeError(
-                "Sync provider not initialized. Make sure 'sync_enabled' parameter is set to True in initialization.")
-
         try:
-            processed_data = self.preprocess_messages(messages)
-            params = self._build_generate_params(processed_data, temperature, max_tokens, stop, **kwargs)
-            response = self.provider.models.generate_content(**params)
-            return self.postprocess_response(response)
+            is_gemini = self._is_gemini_model()
+            logger.info(f"Vertex AI completion: model={self.model_name}, "
+                        f"is_gemini={is_gemini}, mg_provider={'yes' if self._mg_provider else 'no'}")
+            if is_gemini:
+                if not self.provider:
+                    raise RuntimeError(
+                        "Sync provider not initialized. Set 'sync_enabled' to True.")
+                processed_data = self.preprocess_messages(messages)
+                params = self._build_generate_params(processed_data, temperature, max_tokens, stop, **kwargs)
+                response = self.provider.models.generate_content(**params)
+                return self.postprocess_response(response)
+            else:
+                if not self._mg_provider:
+                    raise RuntimeError(
+                        "Model Garden provider not initialized. Ensure Vertex AI mode is enabled "
+                        "with a valid project. Set GOOGLE_CLOUD_PROJECT or pass project in ext_config.")
+                openai_params = self._build_openai_params(messages, temperature, max_tokens, stop, **kwargs)
+                response = self._mg_provider.chat.completions.create(**openai_params)
+                return ModelResponse.from_openai_response(response)
         except Exception as e:
             if isinstance(e, LLMResponseError):
                 raise e
@@ -429,28 +587,28 @@ class VertexAIProvider(LLMProviderBase):
                           **kwargs) -> ModelResponse:
         """Asynchronously call Vertex AI to generate response.
 
-        Args:
-            messages: Message list.
-            temperature: Temperature parameter.
-            max_tokens: Maximum number of tokens to generate.
-            stop: List of stop sequences.
-            **kwargs: Other parameters.
-
-        Returns:
-            ModelResponse object.
-
-        Raises:
-            LLMResponseError: When API call fails.
+        Routes to google-genai for Gemini models, OpenAI-compatible endpoint for Model Garden.
         """
-        if not self.async_provider:
-            raise RuntimeError(
-                "Async provider not initialized. Make sure 'async_enabled' parameter is set to True in initialization.")
-
         try:
-            processed_data = self.preprocess_messages(messages)
-            params = self._build_generate_params(processed_data, temperature, max_tokens, stop, **kwargs)
-            response = await self.async_provider.aio.models.generate_content(**params)
-            return self.postprocess_response(response)
+            is_gemini = self._is_gemini_model()
+            logger.info(f"Vertex AI acompletion: model={self.model_name}, "
+                        f"is_gemini={is_gemini}, mg_async_provider={'yes' if self._mg_async_provider else 'no'}")
+            if is_gemini:
+                if not self.async_provider:
+                    raise RuntimeError(
+                        "Async provider not initialized. Set 'async_enabled' to True.")
+                processed_data = self.preprocess_messages(messages)
+                params = self._build_generate_params(processed_data, temperature, max_tokens, stop, **kwargs)
+                response = await self.async_provider.aio.models.generate_content(**params)
+                return self.postprocess_response(response)
+            else:
+                if not self._mg_async_provider:
+                    raise RuntimeError(
+                        "Model Garden async provider not initialized. Ensure Vertex AI mode is enabled "
+                        "with a valid project. Set GOOGLE_CLOUD_PROJECT or pass project in ext_config.")
+                openai_params = self._build_openai_params(messages, temperature, max_tokens, stop, **kwargs)
+                response = await self._mg_async_provider.chat.completions.create(**openai_params)
+                return ModelResponse.from_openai_response(response)
         except Exception as e:
             if isinstance(e, LLMResponseError):
                 raise e
@@ -465,39 +623,39 @@ class VertexAIProvider(LLMProviderBase):
                           **kwargs) -> Generator[ModelResponse, None, None]:
         """Synchronously call Vertex AI to generate streaming response.
 
-        Args:
-            messages: Message list.
-            temperature: Temperature parameter.
-            max_tokens: Maximum number of tokens to generate.
-            stop: List of stop sequences.
-            **kwargs: Other parameters.
-
-        Returns:
-            Generator yielding ModelResponse chunks.
-
-        Raises:
-            LLMResponseError: When API call fails.
+        Routes to google-genai for Gemini models, OpenAI-compatible endpoint for Model Garden.
         """
-        if not self.provider:
-            raise RuntimeError(
-                "Sync provider not initialized. Make sure 'sync_enabled' parameter is set to True in initialization.")
+        usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
 
         try:
-            processed_data = self.preprocess_messages(messages)
-            params = self._build_generate_params(processed_data, temperature, max_tokens, stop, **kwargs)
-
-            usage = {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
-            }
-
-            for chunk in self.provider.models.generate_content_stream(**params):
-                if not chunk:
-                    continue
-                resp = self.postprocess_stream_response(chunk)
-                self._accumulate_chunk_usage(usage, resp.usage)
-                yield resp
+            if self._is_gemini_model():
+                if not self.provider:
+                    raise RuntimeError(
+                        "Sync provider not initialized. Set 'sync_enabled' to True.")
+                processed_data = self.preprocess_messages(messages)
+                params = self._build_generate_params(processed_data, temperature, max_tokens, stop, **kwargs)
+                for chunk in self.provider.models.generate_content_stream(**params):
+                    if not chunk:
+                        continue
+                    resp = self.postprocess_stream_response(chunk)
+                    self._accumulate_chunk_usage(usage, resp.usage)
+                    yield resp
+            else:
+                if not self._mg_provider:
+                    raise RuntimeError(
+                        "Model Garden provider not initialized. Ensure Vertex AI mode is enabled.")
+                openai_params = self._build_openai_params(messages, temperature, max_tokens, stop, **kwargs)
+                openai_params["stream"] = True
+                for chunk in self._mg_provider.chat.completions.create(**openai_params):
+                    if not chunk:
+                        continue
+                    resp = ModelResponse.from_openai_stream_chunk(chunk)
+                    self._accumulate_chunk_usage(usage, resp.usage)
+                    yield resp
 
         except Exception as e:
             if isinstance(e, LLMResponseError):
@@ -513,39 +671,40 @@ class VertexAIProvider(LLMProviderBase):
                                  **kwargs) -> AsyncGenerator[ModelResponse, None]:
         """Asynchronously call Vertex AI to generate streaming response.
 
-        Args:
-            messages: Message list.
-            temperature: Temperature parameter.
-            max_tokens: Maximum number of tokens to generate.
-            stop: List of stop sequences.
-            **kwargs: Other parameters.
-
-        Returns:
-            AsyncGenerator yielding ModelResponse chunks.
-
-        Raises:
-            LLMResponseError: When API call fails.
+        Routes to google-genai for Gemini models, OpenAI-compatible endpoint for Model Garden.
         """
-        if not self.async_provider:
-            raise RuntimeError(
-                "Async provider not initialized. Make sure 'async_enabled' parameter is set to True in initialization.")
+        usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
 
         try:
-            processed_data = self.preprocess_messages(messages)
-            params = self._build_generate_params(processed_data, temperature, max_tokens, stop, **kwargs)
-
-            usage = {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
-            }
-
-            async for chunk in await self.async_provider.aio.models.generate_content_stream(**params):
-                if not chunk:
-                    continue
-                resp = self.postprocess_stream_response(chunk)
-                self._accumulate_chunk_usage(usage, resp.usage)
-                yield resp
+            if self._is_gemini_model():
+                if not self.async_provider:
+                    raise RuntimeError(
+                        "Async provider not initialized. Set 'async_enabled' to True.")
+                processed_data = self.preprocess_messages(messages)
+                params = self._build_generate_params(processed_data, temperature, max_tokens, stop, **kwargs)
+                async for chunk in await self.async_provider.aio.models.generate_content_stream(**params):
+                    if not chunk:
+                        continue
+                    resp = self.postprocess_stream_response(chunk)
+                    self._accumulate_chunk_usage(usage, resp.usage)
+                    yield resp
+            else:
+                if not self._mg_async_provider:
+                    raise RuntimeError(
+                        "Model Garden async provider not initialized. Ensure Vertex AI mode is enabled.")
+                openai_params = self._build_openai_params(messages, temperature, max_tokens, stop, **kwargs)
+                openai_params["stream"] = True
+                stream = await self._mg_async_provider.chat.completions.create(**openai_params)
+                async for chunk in stream:
+                    if not chunk:
+                        continue
+                    resp = ModelResponse.from_openai_stream_chunk(chunk)
+                    self._accumulate_chunk_usage(usage, resp.usage)
+                    yield resp
 
         except Exception as e:
             if isinstance(e, LLMResponseError):
