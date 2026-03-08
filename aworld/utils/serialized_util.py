@@ -38,7 +38,8 @@ def to_serializable(obj, _memo=None):
         return obj.dict()
     elif hasattr(obj, "__dataclass_fields__"):
         return {field.name: to_serializable(getattr(obj, field.name), _memo)
-                for field in obj.__dataclass_fields__.values()}
+                for field in obj.__dataclass_fields__.values()
+                if not field.name.startswith('_') and not callable(getattr(obj, field.name, None))}
     elif hasattr(obj, "__dict__"):
         return {k: to_serializable(v, _memo) for k, v in obj.__dict__.items()
                 if not k.startswith('_') and not callable(v)}
